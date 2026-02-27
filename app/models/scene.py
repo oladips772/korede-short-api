@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from sqlalchemy import String, Integer, Float, Text, DateTime, ForeignKey, func, UniqueConstraint, CheckConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 
 from app.database import Base
 
@@ -28,11 +28,14 @@ class Scene(Base):
     scene_number: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
 
-    # Input data (from n8n)
+    # Input data
     image_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     animation_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     narration_text: Mapped[str] = mapped_column(Text, nullable=False)
     voice_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Ken Burns motion control (kenburns channel only)
+    pan_direction: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    ken_burns_keypoints: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
     # Output artifacts (S3 URLs)
     image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)

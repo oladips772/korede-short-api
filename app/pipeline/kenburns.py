@@ -17,7 +17,8 @@ async def apply_kenburns_and_upload(
     voice_duration: float,
     resolution: str,
     fps: int,
-    previous_effect: str | None = None,
+    keypoints: list[dict] | None = None,
+    pan_direction: str | None = None,
     temp_dir: str | None = None,
 ) -> tuple[str, str]:
     """
@@ -25,14 +26,15 @@ async def apply_kenburns_and_upload(
     Returns (s3_url, effect_name).
     """
     log = logger.bind(job_id=job_id, scene_number=scene_number)
-    log.info("Applying Ken Burns effect")
+    log.info("Applying Ken Burns effect", effect="keypoints" if keypoints else pan_direction or "auto")
 
     effect_name, filter_str = build_kenburns_filter(
         scene_number=scene_number,
         voice_duration=voice_duration,
         resolution=resolution,
         fps=fps,
-        previous_effect=previous_effect,
+        keypoints=keypoints,
+        pan_direction=pan_direction,
     )
 
     out_dir = temp_dir or os.path.join(settings.temp_dir, job_id, "videos")

@@ -52,6 +52,11 @@ async def start_render(
 
     # Create scene records
     for scene_payload in payload.scenes:
+        kps = (
+            [kp.model_dump() for kp in scene_payload.ken_burns_keypoints]
+            if scene_payload.ken_burns_keypoints
+            else None
+        )
         scene = Scene(
             render_job_id=job.id,
             scene_number=scene_payload.scene_number,
@@ -59,6 +64,8 @@ async def start_render(
             animation_prompt=scene_payload.animation_prompt,
             narration_text=scene_payload.narration_text,
             voice_id=scene_payload.voice_id,
+            pan_direction=scene_payload.pan_direction,
+            ken_burns_keypoints=kps,
         )
         db.add(scene)
 

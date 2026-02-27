@@ -1,68 +1,46 @@
-import random
-from typing import NamedTuple
+from __future__ import annotations
 
-# Ken Burns effect presets (zoompan filter expressions).
-# Placeholders: {duration} = total frames, {resolution} = WxH, {fps} = frame rate
-KENBURNS_PRESETS: dict[str, str] = {
-    "zoom_in_center": (
-        "zoompan=z='min(zoom+0.0015,1.5)':d={duration}"
-        ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={resolution}:fps={fps}"
-    ),
-    "zoom_out_center": (
-        "zoompan=z='if(eq(on,1),1.5,max(zoom-0.0015,1.0))':d={duration}"
-        ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={resolution}:fps={fps}"
-    ),
-    "pan_left_to_right": (
-        "zoompan=z='1.3':d={duration}"
-        ":x='if(eq(on,1),0,min(x+2,(iw-iw/zoom)))':y='ih/2-(ih/zoom/2)':s={resolution}:fps={fps}"
-    ),
-    "pan_right_to_left": (
-        "zoompan=z='1.3':d={duration}"
-        ":x='if(eq(on,1),(iw-iw/zoom),max(x-2,0))':y='ih/2-(ih/zoom/2)':s={resolution}:fps={fps}"
-    ),
-    "pan_top_to_bottom": (
-        "zoompan=z='1.3':d={duration}"
-        ":x='iw/2-(iw/zoom/2)':y='if(eq(on,1),0,min(y+2,(ih-ih/zoom)))':s={resolution}:fps={fps}"
-    ),
-    "pan_bottom_to_top": (
-        "zoompan=z='1.3':d={duration}"
-        ":x='iw/2-(iw/zoom/2)':y='if(eq(on,1),(ih-ih/zoom),max(y-2,0))':s={resolution}:fps={fps}"
-    ),
-    "zoom_in_top_left": (
-        "zoompan=z='min(zoom+0.0015,1.5)':d={duration}:x='0':y='0':s={resolution}:fps={fps}"
-    ),
-    "zoom_in_bottom_right": (
-        "zoompan=z='min(zoom+0.0015,1.5)':d={duration}"
-        ":x='iw-(iw/zoom)':y='ih-(ih/zoom)':s={resolution}:fps={fps}"
-    ),
-    "slow_drift": (
-        "zoompan=z='1.1':d={duration}"
-        ":x='iw/2-(iw/zoom/2)+sin(on/50)*50':y='ih/2-(ih/zoom/2)+cos(on/50)*30':s={resolution}:fps={fps}"
-    ),
+# Default keypoints for each pan direction.
+# x, y are focal-point percentages (0-100) of the image; zoom is the zoom factor.
+_DIRECTION_KEYPOINTS: dict[str, list[dict]] = {
+    "right":    [{"x": 25, "y": 50, "zoom": 1.2}, {"x": 75, "y": 50, "zoom": 1.3}],
+    "left":     [{"x": 75, "y": 50, "zoom": 1.2}, {"x": 25, "y": 50, "zoom": 1.3}],
+    "up":       [{"x": 50, "y": 70, "zoom": 1.2}, {"x": 50, "y": 30, "zoom": 1.3}],
+    "down":     [{"x": 50, "y": 30, "zoom": 1.2}, {"x": 50, "y": 70, "zoom": 1.3}],
+    "zoom_in":  [{"x": 50, "y": 50, "zoom": 1.0}, {"x": 50, "y": 50, "zoom": 1.5}],
+    "zoom_out": [{"x": 50, "y": 50, "zoom": 1.5}, {"x": 50, "y": 50, "zoom": 1.0}],
 }
 
-PRESET_NAMES = list(KENBURNS_PRESETS.keys())
+# Cycle used when no keypoints and no pan_direction are provided
+_AUTO_CYCLE = ["right", "left", "zoom_in", "up", "down", "zoom_out", "right", "left"]
 
 
-class KenBurnsEffect(NamedTuple):
-    name: str
-    filter_expr: str
-
-
-def get_effect_for_scene(scene_number: int, previous_effect: str | None = None) -> KenBurnsEffect:
+def _interp_expr(values: list[float], total_frames: int) -> str:
     """
-    Return a Ken Burns effect for the scene.
-    Cycles through presets in order, but ensures no two adjacent scenes use the same effect.
+    Build an FFmpeg arithmetic expression that linearly interpolates through
+    *values* over *total_frames* frames (the zoompan 'on' variable counts frames).
     """
-    idx = (scene_number - 1) % len(PRESET_NAMES)
-    name = PRESET_NAMES[idx]
+    n = len(values)
+    if n == 1:
+        return f"{values[0]:.6f}"
 
-    # Avoid repeating the same effect for consecutive scenes
-    if name == previous_effect:
-        idx = (idx + 1) % len(PRESET_NAMES)
-        name = PRESET_NAMES[idx]
+    if n == 2:
+        v0, v1 = values[0], values[1]
+        return f"{v0:.6f}+{(v1 - v0):.6f}*on/{total_frames}"
 
-    return KenBurnsEffect(name=name, filter_expr=KENBURNS_PRESETS[name])
+    seg = total_frames / (n - 1)
+
+    def _seg(i: int) -> str:
+        v0, v1 = values[i], values[i + 1]
+        start = i * seg
+        return f"{v0:.6f}+{(v1 - v0):.6f}*(on-{start:.2f})/{seg:.2f}"
+
+    # Build right-to-left nested if() chain
+    expr = _seg(n - 2)
+    for i in range(n - 3, -1, -1):
+        threshold = (i + 1) * seg
+        expr = f"if(lte(on,{threshold:.2f}),{_seg(i)},{expr})"
+    return expr
 
 
 def build_kenburns_filter(
@@ -70,18 +48,43 @@ def build_kenburns_filter(
     voice_duration: float,
     resolution: str,
     fps: int,
-    previous_effect: str | None = None,
+    keypoints: list[dict] | None = None,
+    pan_direction: str | None = None,
 ) -> tuple[str, str]:
     """
-    Build the zoompan filter string for a Ken Burns scene.
+    Build a zoompan filter string for a Ken Burns scene.
     Returns (effect_name, filter_string).
-    """
-    effect = get_effect_for_scene(scene_number, previous_effect)
-    total_frames = int(voice_duration * fps)
 
-    filter_str = effect.filter_expr.format(
-        duration=total_frames,
-        resolution=resolution,
-        fps=fps,
+    Priority:
+      1. Explicit keypoints  — [{x: 0-100, y: 0-100, zoom: float}, ...]
+      2. pan_direction       — "right" | "left" | "up" | "down" | "zoom_in" | "zoom_out"
+      3. Auto-cycle          — derived from scene_number
+    """
+    total_frames = max(1, int(voice_duration * fps))
+
+    if keypoints and len(keypoints) >= 2:
+        kps = keypoints
+        effect_name = "custom_keypoints"
+    else:
+        direction = (
+            pan_direction
+            if pan_direction in _DIRECTION_KEYPOINTS
+            else _AUTO_CYCLE[(scene_number - 1) % len(_AUTO_CYCLE)]
+        )
+        kps = _DIRECTION_KEYPOINTS[direction]
+        effect_name = direction
+
+    x_vals = [kp["x"] / 100.0 for kp in kps]
+    y_vals = [kp["y"] / 100.0 for kp in kps]
+    z_vals = [float(kp["zoom"]) for kp in kps]
+
+    z_expr = _interp_expr(z_vals, total_frames)
+    # 'zoom' in x/y expressions refers to the current frame's zoom value output by z_expr
+    x_expr = f"iw*({_interp_expr(x_vals, total_frames)})-iw/zoom/2"
+    y_expr = f"ih*({_interp_expr(y_vals, total_frames)})-ih/zoom/2"
+
+    filter_str = (
+        f"zoompan=z='{z_expr}':d={total_frames}"
+        f":x='{x_expr}':y='{y_expr}':s={resolution}:fps={fps}"
     )
-    return effect.name, filter_str
+    return effect_name, filter_str

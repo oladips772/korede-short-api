@@ -1,7 +1,13 @@
 from __future__ import annotations
 from typing import Literal, Optional
 from uuid import UUID
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, field_validator
+
+
+class KenBurnsKeypoint(BaseModel):
+    x: float = Field(..., ge=0, le=100, description="Focal-point X as % of image width")
+    y: float = Field(..., ge=0, le=100, description="Focal-point Y as % of image height")
+    zoom: float = Field(..., ge=1.0, le=4.0, description="Zoom factor (1.0 = no zoom)")
 
 
 class RenderSettings(BaseModel):
@@ -16,16 +22,15 @@ class RenderSettings(BaseModel):
     def validate_background_music(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return v
-        # Accept full HTTP/HTTPS URLs (Cloudinary, S3 presigned, any CDN)
         if v.startswith(("http://", "https://")):
             return v
-        # Accept S3 keys — must be a non-empty string that doesn't look like a path typo
         if v.strip():
             return v.strip()
         raise ValueError("background_music must be an HTTP/HTTPS URL or a non-empty S3 key")
+
     subtitle_enabled: bool = True
     subtitle_style: Literal["bold_center", "bottom_bar", "minimal"] = "bold_center"
-    transition_type: Literal["crossfade", "cut"] = "crossfade"
+    transition_type: Literal["cut", "crossfade"] = "cut"
     transition_duration_ms: int = Field(default=500, ge=0, le=2000)
 
 
@@ -35,6 +40,13 @@ class ScenePayload(BaseModel):
     animation_prompt: Optional[str] = None
     narration_text: str
     voice_id: str
+    # Ken Burns channel — optional per-scene motion control
+    pan_direction: Optional[Literal["right", "left", "up", "down", "zoom_in", "zoom_out"]] = None
+    ken_burns_keypoints: Optional[list[KenBurnsKeypoint]] = Field(
+        default=None,
+        min_length=2,
+        description="At least 2 keypoints for a smooth Ken Burns path",
+    )
 
 
 class RenderRequest(BaseModel):

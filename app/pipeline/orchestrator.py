@@ -246,6 +246,8 @@ async def process_scene(
                 voice_duration=voice_duration,
                 resolution=_ffmpeg_resolution(resolution, aspect_ratio),
                 fps=fps,
+                keypoints=scene.ken_burns_keypoints,
+                pan_direction=scene.pan_direction,
                 temp_dir=temp_dirs["videos"],
             )
             safe_delete(local_image)
