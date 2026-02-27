@@ -16,6 +16,7 @@ from app.pipeline.video_assembler import assemble_final_video
 from app.services.s3 import s3
 from app.services.webhook import dispatch_webhook, build_completion_payload, build_failure_payload
 from app.utils.cleanup import ensure_job_dirs, cleanup_job_temp_dir, safe_delete
+from app.database import AsyncSessionLocal
 from app.config import settings
 
 logger = structlog.get_logger()
@@ -59,12 +60,11 @@ async def run_render_pipeline(job_id: str, db: AsyncSession) -> None:
 
         tasks = [
             process_scene(
-                scene=s,
-                job=job,
+                scene_id=str(s.id),
+                job_id=job_id,
                 project_id=project_id,
                 job_settings=job_settings,
                 temp_dirs=temp_dirs,
-                db=db,
             )
             for s in batch
         ]
@@ -150,115 +150,116 @@ async def run_render_pipeline(job_id: str, db: AsyncSession) -> None:
 
 
 async def process_scene(
-    scene: Scene,
-    job: RenderJob,
+    scene_id: str,
+    job_id: str,
     project_id: str,
     job_settings: dict,
     temp_dirs: dict,
-    db: AsyncSession,
 ) -> str:
-    """Process a single scene through the full pipeline. Returns assembled S3 URL."""
-    log = logger.bind(job_id=str(job.id), scene_number=scene.scene_number)
-    aspect_ratio = job_settings.get("aspect_ratio", "16:9")
-    resolution = job_settings.get("resolution", "1K")
-    fps = job_settings.get("fps", 30)
+    """Process a single scene. Uses its own DB session so scenes can run concurrently."""
+    async with AsyncSessionLocal() as db:
+        scene = await db.get(Scene, scene_id)
+        job = await db.get(RenderJob, job_id)
 
-    # Step 1: Generate image and voice in parallel
-    scene.status = "generating_image"
-    await db.commit()
+        log = logger.bind(job_id=job_id, scene_number=scene.scene_number)
+        aspect_ratio = job_settings.get("aspect_ratio", "16:9")
+        resolution = job_settings.get("resolution", "1K")
+        fps = job_settings.get("fps", 30)
 
-    image_task = generate_and_upload_image(
-        project_id=project_id,
-        job_id=str(job.id),
-        scene_number=scene.scene_number,
-        image_prompt=scene.image_prompt,
-        aspect_ratio=aspect_ratio,
-        resolution=resolution,
-    )
-    voice_task = generate_and_upload_voice(
-        project_id=project_id,
-        job_id=str(job.id),
-        scene_number=scene.scene_number,
-        narration_text=scene.narration_text,
-        voice_id=scene.voice_id,
-    )
-
-    image_url, (voice_url, voice_duration) = await asyncio.gather(image_task, voice_task)
-
-    scene.image_url = image_url
-    scene.voice_url = voice_url
-    scene.voice_duration_seconds = voice_duration
-
-    # Step 2: Generate video clip
-    if job.channel == "animated":
-        scene.status = "animating"
+        # Step 1: Generate image and voice in parallel
+        scene.status = "generating_image"
         await db.commit()
 
-        raw_video_url = await animate_and_upload(
+        image_task = generate_and_upload_image(
             project_id=project_id,
-            job_id=str(job.id),
+            job_id=job_id,
             scene_number=scene.scene_number,
-            image_url=image_url,
-            animation_prompt=scene.animation_prompt or scene.image_prompt,
-            voice_duration=voice_duration,
-        )
-    else:
-        # kenburns channel
-        scene.status = "applying_effects"
-        await db.commit()
-
-        # Download image locally for FFmpeg
-        image_key = _url_to_key(image_url)
-        local_image = os.path.join(temp_dirs["images"], f"scene_{scene.scene_number:04d}.png")
-        s3.download_file(image_key, local_image)
-
-        raw_video_url, _ = await apply_kenburns_and_upload(
-            project_id=project_id,
-            job_id=str(job.id),
-            scene_number=scene.scene_number,
-            image_local_path=local_image,
-            voice_duration=voice_duration,
+            image_prompt=scene.image_prompt,
+            aspect_ratio=aspect_ratio,
             resolution=resolution,
-            fps=fps,
-            temp_dir=temp_dirs["videos"],
         )
-        safe_delete(local_image)
+        voice_task = generate_and_upload_voice(
+            project_id=project_id,
+            job_id=job_id,
+            scene_number=scene.scene_number,
+            narration_text=scene.narration_text,
+            voice_id=scene.voice_id,
+        )
 
-    scene.raw_video_url = raw_video_url
+        image_url, (voice_url, voice_duration) = await asyncio.gather(image_task, voice_task)
 
-    # Step 3: Assemble scene (video + audio + subtitles)
-    scene.status = "assembling"
-    await db.commit()
+        scene.image_url = image_url
+        scene.voice_url = voice_url
+        scene.voice_duration_seconds = voice_duration
 
-    # Download video and voice locally
-    video_key = _url_to_key(raw_video_url)
-    voice_key = _url_to_key(voice_url)
-    local_video = os.path.join(temp_dirs["videos"], f"scene_{scene.scene_number:04d}_raw.mp4")
-    local_voice = os.path.join(temp_dirs["voices"], f"scene_{scene.scene_number:04d}.mp3")
-    s3.download_file(video_key, local_video)
-    s3.download_file(voice_key, local_voice)
+        # Step 2: Generate video clip
+        if job.channel == "animated":
+            scene.status = "animating"
+            await db.commit()
 
-    assembled_url = await assemble_scene(
-        project_id=project_id,
-        job_id=str(job.id),
-        scene_number=scene.scene_number,
-        video_local_path=local_video,
-        voice_local_path=local_voice,
-        voice_duration=voice_duration,
-        narration_text=scene.narration_text,
-        subtitle_enabled=job_settings.get("subtitle_enabled", True),
-        subtitle_style=job_settings.get("subtitle_style", "bold_center"),
-        temp_dir=temp_dirs["scenes"],
-    )
-    safe_delete(local_video)
-    safe_delete(local_voice)
+            raw_video_url = await animate_and_upload(
+                project_id=project_id,
+                job_id=job_id,
+                scene_number=scene.scene_number,
+                image_url=image_url,
+                animation_prompt=scene.animation_prompt or scene.image_prompt,
+                voice_duration=voice_duration,
+            )
+        else:
+            # kenburns channel
+            scene.status = "applying_effects"
+            await db.commit()
 
-    scene.assembled_scene_url = assembled_url
-    scene.status = "completed"
-    await db.commit()
+            image_key = _url_to_key(image_url)
+            local_image = os.path.join(temp_dirs["images"], f"scene_{scene.scene_number:04d}.png")
+            s3.download_file(image_key, local_image)
 
-    log.info("Scene completed", assembled_url=assembled_url)
-    return assembled_url
+            raw_video_url, _ = await apply_kenburns_and_upload(
+                project_id=project_id,
+                job_id=job_id,
+                scene_number=scene.scene_number,
+                image_local_path=local_image,
+                voice_duration=voice_duration,
+                resolution=resolution,
+                fps=fps,
+                temp_dir=temp_dirs["videos"],
+            )
+            safe_delete(local_image)
+
+        scene.raw_video_url = raw_video_url
+
+        # Step 3: Assemble scene (video + audio + subtitles)
+        scene.status = "assembling"
+        await db.commit()
+
+        video_key = _url_to_key(raw_video_url)
+        voice_key = _url_to_key(voice_url)
+        local_video = os.path.join(temp_dirs["videos"], f"scene_{scene.scene_number:04d}_raw.mp4")
+        local_voice = os.path.join(temp_dirs["voices"], f"scene_{scene.scene_number:04d}.mp3")
+        s3.download_file(video_key, local_video)
+        s3.download_file(voice_key, local_voice)
+
+        assembled_url = await assemble_scene(
+            project_id=project_id,
+            job_id=job_id,
+            scene_number=scene.scene_number,
+            video_local_path=local_video,
+            voice_local_path=local_voice,
+            voice_duration=voice_duration,
+            narration_text=scene.narration_text,
+            subtitle_enabled=job_settings.get("subtitle_enabled", True),
+            subtitle_style=job_settings.get("subtitle_style", "bold_center"),
+            temp_dir=temp_dirs["scenes"],
+        )
+        safe_delete(local_video)
+        safe_delete(local_voice)
+
+        scene.assembled_scene_url = assembled_url
+        scene.status = "completed"
+        await db.commit()
+
+        log.info("Scene completed", assembled_url=assembled_url)
+        return assembled_url
 
 
 def _url_to_key(s3_url: str) -> str:

@@ -74,12 +74,11 @@ def retry_scenes(self: Task, job_id: str, scene_numbers: list[int]) -> dict:
 
             tasks = [
                 process_scene(
-                    scene=s,
-                    job=job,
+                    scene_id=str(s.id),
+                    job_id=job_id,
                     project_id=project_id,
                     job_settings=job.settings,
                     temp_dirs=temp_dirs,
-                    db=db,
                 )
                 for s in scenes
             ]
