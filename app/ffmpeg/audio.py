@@ -7,6 +7,8 @@ async def normalize_audio(input_path: str, output_path: str) -> None:
         "-i", input_path,
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
         "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
         output_path,
     )
 
@@ -41,6 +43,7 @@ async def mix_background_music(
         "-map", "[aout]",
         "-c:v", "copy",
         "-c:a", "aac",
+        "-b:a", "192k",
         output_path,
         timeout=600,
     )

@@ -1,4 +1,11 @@
+import os
 from app.ffmpeg.commands import run_ffmpeg
+
+# Shared quality flags — must match scene_assembler.py so the concat demuxer
+# sees bit-for-bit compatible streams from every input file.
+_VIDEO_FLAGS = ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p"]
+_AUDIO_FLAGS = ["-c:a", "aac", "-b:a", "192k"]
+_FASTSTART   = ["-movflags", "+faststart"]
 
 
 async def apply_crossfade_concat(
@@ -7,28 +14,49 @@ async def apply_crossfade_concat(
     transition_duration_ms: int = 500,
 ) -> None:
     """
-    Concatenate scene clips with crossfade transitions.
-    For simplicity, uses the concat demuxer (cut transitions) and then applies
-    a crossfade via the xfade filter for pairs of clips if needed.
+    Concatenate scene clips into one video using the concat demuxer.
+
+    All scene files must already be encoded with the same codec, pixel
+    format, and resolution (guaranteed by scene_assembler.py).  We
+    re-encode here anyway so the output file has a clean moov atom and
+    -pix_fmt yuv420p is enforced — this prevents green frames or silent
+    muxing errors that occur when a scene file has a slightly different
+    internal format.
+
+    transition_duration_ms is accepted for API compatibility but is not
+    used (hard-cut only).  True crossfade requires a complex xfade
+    filter graph and is not implemented.
     """
     if len(scene_paths) == 1:
-        # Single scene — just copy
-        await run_ffmpeg("-i", scene_paths[0], "-c", "copy", output_path)
+        # Single scene — re-encode to normalise format and add faststart.
+        await run_ffmpeg(
+            "-i", scene_paths[0],
+            *_VIDEO_FLAGS,
+            *_AUDIO_FLAGS,
+            *_FASTSTART,
+            output_path,
+            timeout=300,
+        )
         return
 
-    # Build a concat file for cut-based joining (fast, no re-encode of video stream)
-    concat_file = output_path + ".concat_list.txt"
-    with open(concat_file, "w") as f:
+    concat_list = output_path + ".concat_list.txt"
+    with open(concat_list, "w") as f:
         for path in scene_paths:
-            f.write(f"file '{path}'\n")
+            # Escape single quotes in path for the concat list format.
+            safe_path = path.replace("'", r"'\''")
+            f.write(f"file '{safe_path}'\n")
 
-    await run_ffmpeg(
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concat_file,
-        "-c:v", "libx264",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        output_path,
-        timeout=600,
-    )
+    try:
+        await run_ffmpeg(
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_list,
+            *_VIDEO_FLAGS,
+            *_AUDIO_FLAGS,
+            *_FASTSTART,
+            output_path,
+            timeout=600,
+        )
+    finally:
+        if os.path.exists(concat_list):
+            os.remove(concat_list)

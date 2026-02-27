@@ -16,6 +16,7 @@ from app.pipeline.video_assembler import assemble_final_video
 from app.services.s3 import s3
 from app.services.webhook import dispatch_webhook, build_completion_payload, build_failure_payload
 from app.utils.cleanup import ensure_job_dirs, cleanup_job_temp_dir, safe_delete
+from app.ffmpeg.commands import get_video_duration
 from app.database import AsyncSessionLocal
 from app.config import settings
 
@@ -42,7 +43,7 @@ def _ffmpeg_resolution(resolution: str, aspect_ratio: str) -> str:
     """Convert a Kie.ai resolution code (e.g. '1K') to FFmpeg pixel dimensions (e.g. '1280x720').
     Falls back to the raw value if it already looks like a pixel dimension."""
     if "x" in resolution:
-        return resolution  # already in WxH format
+        return resolution
     return _RESOLUTION_MAP.get((resolution.upper(), aspect_ratio), "1280x720")
 
 
@@ -55,12 +56,10 @@ async def run_render_pipeline(job_id: str, db: AsyncSession) -> None:
         log.error("Render job not found")
         return
 
-    # Update status
     job.status = "processing"
     job.started_at = datetime.now(timezone.utc)
     await db.commit()
 
-    # Load scenes
     result = await db.execute(
         select(Scene)
         .where(Scene.render_job_id == job.id)
@@ -77,7 +76,6 @@ async def run_render_pipeline(job_id: str, db: AsyncSession) -> None:
 
     assembled_urls: dict[int, str] = {}
 
-    # Process scenes in batches
     for batch_start in range(0, len(scenes), batch_size):
         batch = scenes[batch_start : batch_start + batch_size]
         log.info("Processing batch", batch_start=batch_start, batch_size=len(batch))
@@ -106,7 +104,6 @@ async def run_render_pipeline(job_id: str, db: AsyncSession) -> None:
 
         await db.commit()
 
-    # Determine success threshold
     total = job.total_scenes
     completed = job.completed_scenes
     failed = job.failed_scenes
@@ -115,27 +112,25 @@ async def run_render_pipeline(job_id: str, db: AsyncSession) -> None:
     if success_ratio < settings.scene_failure_threshold:
         job.status = "failed"
         job.error_message = (
-            f"Too many scenes failed ({failed}/{total}). Below {settings.scene_failure_threshold * 100:.0f}% threshold."
+            f"Too many scenes failed ({failed}/{total}). "
+            f"Below {settings.scene_failure_threshold * 100:.0f}% threshold."
         )
         job.completed_at = datetime.now(timezone.utc)
         await db.commit()
-
         if job.webhook_url:
             failed_nums = [s.scene_number for s in scenes if s.status == "failed"]
             await dispatch_webhook(job.webhook_url, build_failure_payload(job, failed_nums))
         cleanup_job_temp_dir(job_id)
         return
 
-    # Assemble final video
     job.status = "assembling"
     await db.commit()
 
-    # Sort assembled scenes by scene number, insert placeholder for failed ones
-    ordered_urls = []
-    for scene in scenes:
-        if scene.scene_number in assembled_urls:
-            ordered_urls.append(assembled_urls[scene.scene_number])
-        # Failed scenes are skipped (partial_failure)
+    ordered_urls = [
+        assembled_urls[scene.scene_number]
+        for scene in scenes
+        if scene.scene_number in assembled_urls
+    ]
 
     try:
         final_url = await assemble_final_video(
@@ -151,7 +146,6 @@ async def run_render_pipeline(job_id: str, db: AsyncSession) -> None:
         job.completed_at = datetime.now(timezone.utc)
         await db.commit()
 
-        # Load project name for webhook
         project = await db.get(job.__class__, job.project_id)
         project_name = getattr(project, "name", "") if project else ""
 
@@ -190,7 +184,7 @@ async def process_scene(
         resolution = job_settings.get("resolution", "1K")
         fps = job_settings.get("fps", 30)
 
-        # Step 1: Generate image and voice in parallel
+        # ── Step 1: Generate image and voice in parallel ────────────────────
         scene.status = "generating_image"
         await db.commit()
 
@@ -210,13 +204,32 @@ async def process_scene(
             voice_id=scene.voice_id,
         )
 
-        image_url, (voice_url, voice_duration) = await asyncio.gather(image_task, voice_task)
+        image_url, (voice_url, voice_duration_estimate) = await asyncio.gather(
+            image_task, voice_task
+        )
 
         scene.image_url = image_url
         scene.voice_url = voice_url
-        scene.voice_duration_seconds = voice_duration
+        scene.voice_duration_seconds = voice_duration_estimate  # mutagen estimate for reference
 
-        # Step 2: Generate video clip
+        # Download the voice file NOW so we can measure its exact duration with
+        # ffprobe before generating the Ken Burns / animation clip.  Using the
+        # mutagen estimate risks a mismatch of several hundred milliseconds which
+        # causes audio to extend past the video or get cut short.
+        voice_key = _url_to_key(voice_url)
+        local_voice = os.path.join(
+            temp_dirs["voices"], f"scene_{scene.scene_number:04d}.mp3"
+        )
+        s3.download_file(voice_key, local_voice)
+        actual_voice_duration = await get_video_duration(local_voice)
+
+        log.info(
+            "Voice durations",
+            mutagen_estimate=voice_duration_estimate,
+            ffprobe_actual=actual_voice_duration,
+        )
+
+        # ── Step 2: Generate video clip ─────────────────────────────────────
         if job.channel == "animated":
             scene.status = "animating"
             await db.commit()
@@ -227,7 +240,7 @@ async def process_scene(
                 scene_number=scene.scene_number,
                 image_url=image_url,
                 animation_prompt=scene.animation_prompt or scene.image_prompt,
-                voice_duration=voice_duration,
+                voice_duration=actual_voice_duration,
             )
         else:
             # kenburns channel
@@ -235,7 +248,9 @@ async def process_scene(
             await db.commit()
 
             image_key = _url_to_key(image_url)
-            local_image = os.path.join(temp_dirs["images"], f"scene_{scene.scene_number:04d}.png")
+            local_image = os.path.join(
+                temp_dirs["images"], f"scene_{scene.scene_number:04d}.png"
+            )
             s3.download_file(image_key, local_image)
 
             raw_video_url, _ = await apply_kenburns_and_upload(
@@ -243,7 +258,7 @@ async def process_scene(
                 job_id=job_id,
                 scene_number=scene.scene_number,
                 image_local_path=local_image,
-                voice_duration=voice_duration,
+                voice_duration=actual_voice_duration,   # ← exact ffprobe duration
                 resolution=_ffmpeg_resolution(resolution, aspect_ratio),
                 fps=fps,
                 keypoints=scene.ken_burns_keypoints,
@@ -254,16 +269,16 @@ async def process_scene(
 
         scene.raw_video_url = raw_video_url
 
-        # Step 3: Assemble scene (video + audio + subtitles)
+        # ── Step 3: Assemble scene (video + audio + subtitles) ───────────────
         scene.status = "assembling"
         await db.commit()
 
         video_key = _url_to_key(raw_video_url)
-        voice_key = _url_to_key(voice_url)
-        local_video = os.path.join(temp_dirs["videos"], f"scene_{scene.scene_number:04d}_raw.mp4")
-        local_voice = os.path.join(temp_dirs["voices"], f"scene_{scene.scene_number:04d}.mp3")
+        local_video = os.path.join(
+            temp_dirs["videos"], f"scene_{scene.scene_number:04d}_raw.mp4"
+        )
         s3.download_file(video_key, local_video)
-        s3.download_file(voice_key, local_voice)
+        # local_voice is already downloaded from step 1 — no second download needed
 
         assembled_url = await assemble_scene(
             project_id=project_id,
@@ -271,7 +286,7 @@ async def process_scene(
             scene_number=scene.scene_number,
             video_local_path=local_video,
             voice_local_path=local_voice,
-            voice_duration=voice_duration,
+            voice_duration=actual_voice_duration,
             narration_text=scene.narration_text,
             subtitle_enabled=job_settings.get("subtitle_enabled", True),
             subtitle_style=job_settings.get("subtitle_style", "bold_center"),

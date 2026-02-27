@@ -24,11 +24,21 @@ async def apply_kenburns_and_upload(
     """
     Apply Ken Burns effect to a static image and upload to S3.
     Returns (s3_url, effect_name).
+
+    voice_duration must be the EXACT duration measured from the actual audio
+    file via ffprobe — not the mutagen estimate — so that total_frames and
+    the -t trim are perfectly aligned with the narration.
     """
     log = logger.bind(job_id=job_id, scene_number=scene_number)
-    log.info("Applying Ken Burns effect", effect="keypoints" if keypoints else pan_direction or "auto")
+    log.info(
+        "Applying Ken Burns effect",
+        effect="keypoints" if keypoints else pan_direction or "auto",
+        voice_duration=voice_duration,
+        resolution=resolution,
+        fps=fps,
+    )
 
-    effect_name, filter_str = build_kenburns_filter(
+    effect_name, zoompan_filter = build_kenburns_filter(
         scene_number=scene_number,
         voice_duration=voice_duration,
         resolution=resolution,
@@ -37,6 +47,12 @@ async def apply_kenburns_and_upload(
         pan_direction=pan_direction,
     )
 
+    # Prepend a high-resolution scale so zoompan has many pixels to work with.
+    # This prevents blocky/blurry motion when the source image is small.
+    # scale=8000:-2 → width=8000, height computed to keep aspect ratio (even number).
+    # zoompan then crops and outputs at the target resolution (s= parameter).
+    full_filter = f"scale=8000:-2,{zoompan_filter}"
+
     out_dir = temp_dir or os.path.join(settings.temp_dir, job_id, "videos")
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, f"scene_{scene_number:04d}_kenburns.mp4")
@@ -44,12 +60,16 @@ async def apply_kenburns_and_upload(
     await run_ffmpeg(
         "-loop", "1",
         "-i", image_local_path,
-        "-vf", filter_str,
-        "-t", str(voice_duration),
+        "-vf", full_filter,
+        "-t", str(voice_duration),       # safety trim to exact audio length
+        "-r", str(fps),                  # explicit output frame rate
         "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
+        "-preset", "medium",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",           # required for concat compatibility
+        "-movflags", "+faststart",       # moov atom at start for proper seeking
         output_path,
-        timeout=120,
+        timeout=300,                     # scale=8000 is slow; allow extra time
     )
 
     key = get_s3_key(project_id, job_id, "animations", f"scene_{scene_number:04d}.mp4")

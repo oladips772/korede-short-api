@@ -8,7 +8,7 @@ logger = structlog.get_logger()
 async def run_ffmpeg(*args: str, timeout: int = 300) -> None:
     """Run an FFmpeg command asynchronously, raising on non-zero exit."""
     cmd = [settings.ffmpeg_path, "-y", *args]
-    logger.debug("FFmpeg command", cmd=" ".join(cmd))
+    logger.info("FFmpeg command", cmd=" ".join(cmd))
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,

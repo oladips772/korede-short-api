@@ -2,23 +2,35 @@ from __future__ import annotations
 
 # Default keypoints for each pan direction.
 # x, y are focal-point percentages (0-100) of the image; zoom is the zoom factor.
+#
+# GEOMETRY CONSTRAINT: at a given zoom z, the top-left corner of the crop window
+# in input coordinates is:
+#   x_tl = iw * (x_pct/100) - iw / (2*z)
+# For x_tl to be valid: 0 <= x_tl <= iw - iw/z  =>  1/(2z) <= x_pct <= 1 - 1/(2z)
+#
+# At zoom=1.5: valid x range ≈ [33.3%, 66.7%]
+# At zoom=1.8: valid x range ≈ [27.8%, 72.2%]
+# At zoom=2.0: valid x range ≈ [25.0%, 75.0%]
+# All default keypoints below are chosen to stay within these bounds.
+
 _DIRECTION_KEYPOINTS: dict[str, list[dict]] = {
-    "right":    [{"x": 25, "y": 50, "zoom": 1.2}, {"x": 75, "y": 50, "zoom": 1.3}],
-    "left":     [{"x": 75, "y": 50, "zoom": 1.2}, {"x": 25, "y": 50, "zoom": 1.3}],
-    "up":       [{"x": 50, "y": 70, "zoom": 1.2}, {"x": 50, "y": 30, "zoom": 1.3}],
-    "down":     [{"x": 50, "y": 30, "zoom": 1.2}, {"x": 50, "y": 70, "zoom": 1.3}],
-    "zoom_in":  [{"x": 50, "y": 50, "zoom": 1.0}, {"x": 50, "y": 50, "zoom": 1.5}],
-    "zoom_out": [{"x": 50, "y": 50, "zoom": 1.5}, {"x": 50, "y": 50, "zoom": 1.0}],
+    "right":    [{"x": 36, "y": 50, "zoom": 1.5}, {"x": 64, "y": 50, "zoom": 1.5}],
+    "left":     [{"x": 64, "y": 50, "zoom": 1.5}, {"x": 36, "y": 50, "zoom": 1.5}],
+    "up":       [{"x": 50, "y": 64, "zoom": 1.5}, {"x": 50, "y": 36, "zoom": 1.5}],
+    "down":     [{"x": 50, "y": 36, "zoom": 1.5}, {"x": 50, "y": 64, "zoom": 1.5}],
+    "zoom_in":  [{"x": 50, "y": 50, "zoom": 1.0}, {"x": 50, "y": 50, "zoom": 1.8}],
+    "zoom_out": [{"x": 50, "y": 50, "zoom": 1.8}, {"x": 50, "y": 50, "zoom": 1.0}],
 }
 
 # Cycle used when no keypoints and no pan_direction are provided
-_AUTO_CYCLE = ["right", "left", "zoom_in", "up", "down", "zoom_out", "right", "left"]
+_AUTO_CYCLE = ["zoom_in", "right", "left", "zoom_out", "up", "down", "zoom_in", "right"]
 
 
 def _interp_expr(values: list[float], total_frames: int) -> str:
     """
     Build an FFmpeg arithmetic expression that linearly interpolates through
-    *values* over *total_frames* frames (the zoompan 'on' variable counts frames).
+    *values* over *total_frames* frames.  The zoompan filter variable 'on'
+    counts output frames starting at 1.
     """
     n = len(values)
     if n == 1:
@@ -59,6 +71,11 @@ def build_kenburns_filter(
       1. Explicit keypoints  — [{x: 0-100, y: 0-100, zoom: float}, ...]
       2. pan_direction       — "right" | "left" | "up" | "down" | "zoom_in" | "zoom_out"
       3. Auto-cycle          — derived from scene_number
+
+    The filter_string is meant to be prepended by "scale=8000:-2," in the caller
+    so that zoompan operates on a high-resolution input (smooth motion).
+    'iw' and 'ih' inside the expressions will therefore refer to the 8000-px scaled
+    image, not the original — but since we work in percentages the math is identical.
     """
     total_frames = max(1, int(voice_duration * fps))
 
@@ -79,9 +96,16 @@ def build_kenburns_filter(
     z_vals = [float(kp["zoom"]) for kp in kps]
 
     z_expr = _interp_expr(z_vals, total_frames)
-    # 'zoom' in x/y expressions refers to the current frame's zoom value output by z_expr
-    x_expr = f"iw*({_interp_expr(x_vals, total_frames)})-iw/zoom/2"
-    y_expr = f"ih*({_interp_expr(y_vals, total_frames)})-ih/zoom/2"
+
+    # Raw focal-point position (top-left of crop window in input coordinates).
+    # 'zoom' refers to the current frame's zoom value produced by z_expr.
+    x_raw = f"iw*({_interp_expr(x_vals, total_frames)})-iw/zoom/2"
+    y_raw = f"ih*({_interp_expr(y_vals, total_frames)})-ih/zoom/2"
+
+    # Clamp so the crop window never exceeds the image boundaries.
+    # Without clamping, negative x/y values cause corrupted or black-bordered output.
+    x_expr = f"max(0,min({x_raw},iw-iw/zoom))"
+    y_expr = f"max(0,min({y_raw},ih-ih/zoom))"
 
     filter_str = (
         f"zoompan=z='{z_expr}':d={total_frames}"
