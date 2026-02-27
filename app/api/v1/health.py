@@ -34,9 +34,8 @@ async def health_check():
 
     # Redis
     try:
-        r = aioredis.from_url(settings.redis_url)
-        await r.ping()
-        await r.aclose()
+        async with aioredis.from_url(settings.redis_url) as r:
+            await r.ping()
         result["checks"]["redis"] = {"status": "ok"}
     except Exception as e:
         result["checks"]["redis"] = {"status": "error", "detail": str(e)}
