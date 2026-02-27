@@ -33,39 +33,54 @@ async def assemble_scene(
     os.makedirs(base_dir, exist_ok=True)
 
     video_duration = await get_video_duration(video_local_path)
-    speed_factor = calculate_speed_factor(video_duration, voice_duration)
+
+    # Measure the actual audio file duration with ffprobe — this is the
+    # authoritative length for the scene.  The mutagen-derived voice_duration
+    # stored in the DB can be a few frames off, and using -shortest would
+    # silently cut the narration whenever the video ends a fraction early.
+    actual_audio_duration = await get_video_duration(voice_local_path)
+
+    log.debug(
+        "Scene durations",
+        video_duration=video_duration,
+        actual_audio_duration=actual_audio_duration,
+        db_voice_duration=voice_duration,
+    )
+
+    speed_factor = calculate_speed_factor(video_duration, actual_audio_duration)
 
     synced_video = os.path.join(base_dir, f"scene_{scene_number:04d}_synced.mp4")
 
     if speed_factor is None:
-        # Video too short — loop it
-        await _loop_video_to_duration(video_local_path, voice_duration, synced_video)
+        # Video far too short — loop it to fill the full narration
+        await _loop_video_to_duration(video_local_path, actual_audio_duration, synced_video)
     else:
-        # Adjust speed to match voice
-        await _adjust_video_speed(video_local_path, speed_factor, voice_duration, synced_video)
+        # Stretch or compress video to match narration length exactly
+        await _adjust_video_speed(video_local_path, speed_factor, actual_audio_duration, synced_video)
 
-    # Combine with audio
+    # Combine video + audio.
+    # Use explicit -t instead of -shortest so the scene is always exactly the
+    # length of the narration audio — no early cut-off, no bleed into next scene.
     with_audio = os.path.join(base_dir, f"scene_{scene_number:04d}_with_audio.mp4")
     await run_ffmpeg(
         "-i", synced_video,
         "-i", voice_local_path,
         "-map", "0:v",
         "-map", "1:a",
+        "-t", str(actual_audio_duration),
         "-c:v", "libx264",
         "-c:a", "aac",
-        "-shortest",
         with_audio,
         timeout=120,
     )
     safe_delete(synced_video)
 
-    # Burn subtitles
+    # Burn subtitles (use db voice_duration for caption timing — close enough)
     if subtitle_enabled:
         sub_path = os.path.join(base_dir, f"scene_{scene_number:04d}.ass")
-        generate_ass_subtitle(narration_text, voice_duration, subtitle_style, sub_path)
+        generate_ass_subtitle(narration_text, actual_audio_duration, subtitle_style, sub_path)
 
         final_scene = os.path.join(base_dir, f"scene_{scene_number:04d}_final.mp4")
-        # Escape path for FFmpeg subtitle filter
         escaped_sub = sub_path.replace("\\", "/").replace(":", "\\:")
         await run_ffmpeg(
             "-i", with_audio,
@@ -101,12 +116,16 @@ async def _loop_video_to_duration(video_path: str, target_duration: float, outpu
 
 
 async def _adjust_video_speed(
-    video_path: str, speed_factor: float, voice_duration: float, output_path: str
+    video_path: str, speed_factor: float, target_duration: float, output_path: str
 ) -> None:
+    # -stream_loop -1 ensures the PTS-adjusted clip can never run out of frames
+    # before the -t trim point, even when speed_factor is very close to 1.0
+    # and rounding drops a frame or two.
     await run_ffmpeg(
+        "-stream_loop", "-1",
         "-i", video_path,
         "-vf", f"setpts={1.0 / speed_factor}*PTS",
-        "-t", str(voice_duration),
+        "-t", str(target_duration),
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-an",
