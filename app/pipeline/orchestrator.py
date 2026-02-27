@@ -21,6 +21,30 @@ from app.config import settings
 
 logger = structlog.get_logger()
 
+# Map Kie.ai resolution codes + aspect ratio → FFmpeg pixel dimensions (WxH)
+_RESOLUTION_MAP: dict[tuple[str, str], str] = {
+    ("1K", "16:9"): "1280x720",
+    ("1K", "9:16"): "720x1280",
+    ("1K", "1:1"): "1024x1024",
+    ("1K", "4:3"): "1024x768",
+    ("2K", "16:9"): "1920x1080",
+    ("2K", "9:16"): "1080x1920",
+    ("2K", "1:1"): "2048x2048",
+    ("2K", "4:3"): "2048x1536",
+    ("4K", "16:9"): "3840x2160",
+    ("4K", "9:16"): "2160x3840",
+    ("4K", "1:1"): "4096x4096",
+    ("4K", "4:3"): "4096x3072",
+}
+
+
+def _ffmpeg_resolution(resolution: str, aspect_ratio: str) -> str:
+    """Convert a Kie.ai resolution code (e.g. '1K') to FFmpeg pixel dimensions (e.g. '1280x720').
+    Falls back to the raw value if it already looks like a pixel dimension."""
+    if "x" in resolution:
+        return resolution  # already in WxH format
+    return _RESOLUTION_MAP.get((resolution.upper(), aspect_ratio), "1280x720")
+
 
 async def run_render_pipeline(job_id: str, db: AsyncSession) -> None:
     """Main pipeline entry point. Runs the full render for a job."""
@@ -220,7 +244,7 @@ async def process_scene(
                 scene_number=scene.scene_number,
                 image_local_path=local_image,
                 voice_duration=voice_duration,
-                resolution=resolution,
+                resolution=_ffmpeg_resolution(resolution, aspect_ratio),
                 fps=fps,
                 temp_dir=temp_dirs["videos"],
             )
